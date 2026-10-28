@@ -1,0 +1,174 @@
+# Builds the native apps on GitHub's free runners.
+#
+# Every push to main runs the tests and builds Android and Windows; download
+# them from the run's "Artifacts" section.
+#
+# Pushing a version tag (git tag v1.0.0 && git push origin v1.0.0) also
+# builds macOS and publishes all of them as a GitHub Release anyone can
+# download:
+#   Kendra-HMS-windows-setup.exe     installer for Windows 10/11 (64-bit)
+#   Kendra-HMS-windows-portable.zip  the same app, unzip and run
+#   Kendra-HMS-macos.dmg             drag to Applications (macOS 12+)
+#   Kendra-HMS-android.apk           phones and tablets (Android 7+)
+#
+# Public repositories build for free; private ones use the monthly free
+# minutes (macOS minutes count 10x, so the macOS job only runs on tags and
+# manual runs).
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  FLUTTER_VERSION: '3.47.8'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: dart analyze lib test
+      - run: flutter test test/core test/modules test/e2e
+
+  android:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      # Signs the APK with the hospital's release key when the repository has
+      # these secrets (see README "Android release signing"); otherwise the
+      # debug key is used and the APK is for testing only.
+      - name: Release signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::warning::No ANDROID_KEYSTORE_BASE64 secret: the APK is signed with the debug key (testing only)."
+            exit 0
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > android/app/release.jks
+          printf 'storeFile=release.jks\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+            "$KEYSTORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD" > android/key.properties
+      - run: flutter build apk --release
+      - run: cp build/app/outputs/flutter-apk/app-release.apk Kendra-HMS-android.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kendra-android
+          path: Kendra-HMS-android.apk
+
+  windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - run: flutter build windows --release
+      # Flutter apps need the Visual C++ runtime. Shipping it next to the exe
+      # means hospital PCs don't have to install it separately.
+      - name: Bundle the Visual C++ runtime
+        run: |
+          foreach ($dll in 'msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll') {
+            Copy-Item "$env:WINDIR\System32\$dll" build\windows\x64\runner\Release\
+          }
+      - name: Installer and portable zip
+        run: |
+          $version = (Select-String -Path pubspec.yaml -Pattern '^version:\s*([0-9.]+)').Matches[0].Groups[1].Value
+          choco install innosetup --no-progress -y
+          $iscc = (Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup *\ISCC.exe" | Select-Object -First 1).FullName
+          & $iscc "/DAppVersion=$version" windows\installer\kendra_hms.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Compress-Archive -Path build\windows\x64\runner\Release\* -DestinationPath build\installer\Kendra-HMS-windows-portable.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kendra-windows
+          path: |
+            build/installer/Kendra-HMS-windows-setup.exe
+            build/installer/Kendra-HMS-windows-portable.zip
+
+  macos:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - run: flutter build macos --release
+      # A disk image with an Applications shortcut: open it, drag the app in.
+      # hdiutil is occasionally "busy" on CI machines, so it gets 3 tries.
+      - name: Disk image
+        run: |
+          mkdir dmg
+          cp -R "build/macos/Build/Products/Release/Kendra HMS.app" dmg/
+          ln -s /Applications dmg/Applications
+          for try in 1 2 3; do
+            hdiutil create -volname "Kendra HMS" -srcfolder dmg -ov -format UDZO Kendra-HMS-macos.dmg && break
+            sleep 10
+          done
+          test -f Kendra-HMS-macos.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kendra-macos
+          path: Kendra-HMS-macos.dmg
+
+  release:
+    needs: [android, windows, macos]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<'EOF'
+          ## Install
+
+          | Device | Download | How to install |
+          | --- | --- | --- |
+          | Windows 10 or 11 (64-bit) | `Kendra-HMS-windows-setup.exe` | Run it. If SmartScreen warns, click **More info → Run anyway**. |
+          | Windows, without installing | `Kendra-HMS-windows-portable.zip` | Unzip it and run `kendra_hms.exe`. |
+          | Mac (macOS 12 or later) | `Kendra-HMS-macos.dmg` | Open it and drag **Kendra HMS** to Applications. The first time, macOS blocks it because it isn't signed with an Apple Developer ID: open **System Settings → Privacy & Security** and click **Open Anyway**. |
+          | Android 7 or later | `Kendra-HMS-android.apk` | Open the file on the device and allow installing from this source. |
+
+          On first launch, choose **Explore a demo hospital** to try it. Every demo account uses the password `demo1234`.
+
+          The Android app in this release is signed with a test key unless the repository has the release-signing secrets (see the README). Install it for trials only: a later build signed with the hospital's own key can't update it, so tablets would need to uninstall it first.
+          EOF
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Kendra HMS ${GITHUB_REF_NAME#v}" \
+            --notes-file notes.md
